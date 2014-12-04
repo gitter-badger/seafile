@@ -655,6 +655,8 @@ add_path_to_index (SeafRepo *repo, struct index_state *istate,
      * for the worktree root "".
      */
     if (path[0] == 0) {
+        remove_deleted (istate, repo->worktree, ignore_list);
+
         add_recursive (repo->id, repo->version, repo->email, istate,
                        repo->worktree, path,
                        crypt, FALSE, ignore_list,
@@ -1047,13 +1049,6 @@ index_add (SeafRepo *repo, struct index_state *istate,
     }
 
     ignore_list = seaf_repo_load_ignore_files (repo->worktree);
-
-    /* If this is the first commit after the client restarts, remove deleted files
-     * from the index. Since the client doesn't know which files are deleted when
-     * it was shutdown, the only way is to compare the index with worktree.
-     */
-    if (is_initial_commit)
-        remove_deleted (istate, repo->worktree, ignore_list);
 
     if (apply_worktree_changes_to_index (repo, istate, crypt, ignore_list) < 0) {
         seaf_warning ("Failed to apply worktree changes to index.\n");
