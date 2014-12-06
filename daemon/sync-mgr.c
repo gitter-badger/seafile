@@ -26,6 +26,7 @@
 #define CHECK_SYNC_INTERVAL  1000 /* 1s */
 #define UPDATE_TX_STATE_INTERVAL 1000 /* 1s */
 #define MAX_RUNNING_SYNC_TASKS 5
+#define CHECK_LOCKED_FILES_INTERVAL 10 /* 10s */
 
 enum {
     SERVER_SIDE_MERGE_UNKNOWN = 0,
@@ -1987,6 +1988,196 @@ cmp_repos_by_sync_time (gconstpointer a, gconstpointer b, gpointer user_data)
     return (repo_a->last_sync_time - repo_b->last_sync_time);
 }
 
+#ifdef WIN32
+
+static void
+cleanup_file_blocks (const char *repo_id, int version, const char *file_id)
+{
+    Seafile *file;
+    int i;
+
+    file = seaf_fs_manager_get_seafile (seaf->fs_mgr,
+                                        repo_id, version,
+                                        file_id);
+    for (i = 0; i < file->n_blocks; ++i)
+        seaf_block_manager_remove_block (seaf->block_mgr,
+                                         repo_id, version,
+                                         file->blk_sha1s[i]);
+
+    seafile_unref (file);
+}
+
+static gboolean
+handle_locked_file_update (SeafRepo *repo, struct index_state *istate,
+                           LockedFileSet *fset, const char *path, LockedFile *locked)
+{
+    struct cache_entry *ce;
+    char file_id[41];
+    char *fullpath = NULL;
+    SeafStat st;
+    gboolean file_exists = TRUE;
+    SeafileCrypt *crypt = NULL;
+    SeafBranch *master = NULL;
+    gboolean ret = TRUE;
+
+    /* File is still locked, do nothing. */
+    if (do_check_file_locked (path, repo->worktree))
+        return FALSE;
+
+    /* If the file was locked on the last checkout, the worktree file was not
+     * updated, but the index has been updated. So the ce in the index should
+     * contain the information for the file to be updated.
+     */
+    ce = index_name_exists (istate, path, strlen(path), 0);
+    if (!ce) {
+        seaf_warning ("Cache entry for %s in repo %s(%.8s) is not found "
+                      "when update locked file.",
+                      path, repo->name, repo->id);
+        goto remove_from_db;
+    }
+
+    rawdata_to_hex (ce->sha1, file_id, 20);
+
+    fullpath = g_build_filename (repo->worktree, path, NULL);
+
+    file_exists = g_file_test (fullpath, G_FILE_TEST_EXISTS);
+
+    if (file_exists && seaf_stat (fullpath, &st) < 0) {
+        seaf_warning ("Failed to stat %s: %s.\n", fullpath, strerror(errno));
+        goto out;
+    }
+
+    if (repo->encrypted)
+        crypt = seafile_crypt_new (repo->enc_version,
+                                   repo->enc_key,
+                                   repo->enc_iv);
+
+    master = seaf_branch_manager_get_branch (seaf->branch_mgr, repo->id, "master");
+    if (!master) {
+        seaf_warning ("No master branch found for repo %s(%.8s).\n",
+                      repo->name, repo->id);
+        goto out;
+    }
+
+    gboolean conflicted;
+    gboolean force_conflict = (file_exists && st.st_mtime != locked->old_mtime);
+    if (seaf_fs_manager_checkout_file (seaf->fs_mgr,
+                                       repo->id, repo->version,
+                                       file_id, fullpath,
+                                       ce->ce_mode, ce->ce_mtime.sec,
+                                       crypt,
+                                       path,
+                                       master->commit_id,
+                                       force_conflict,
+                                       &conflicted) < 0) {
+        seaf_warning ("Failed to checkout previously locked file %s in repo "
+                      "%s(%.8s).\n",
+                      path, repo->name, repo->id);
+    }
+
+out:
+    cleanup_file_blocks (repo->id, repo->version, file_id);
+
+remove_from_db:
+    /* Remove the locked file record from db. */
+    locked_file_set_remove (fset, path, TURE);
+
+    g_free (fullpath);
+    g_free (crypt);
+    seaf_branch_unref (master);
+    return ret;
+}
+
+static gboolean
+handle_locked_file_delete (SeafRepo *repo, struct index_state *istate,
+                           LockedFileSet *fset, const char *path, LockedFile *locked)
+{
+    char *fullpath = NULL;
+    SeafStat st;
+    gboolean file_exists = TRUE;
+    gboolean ret = TRUE;
+
+    /* File is still locked, do nothing. */
+    if (do_check_file_locked (path, repo->worktree))
+        return FALSE;
+
+    fullpath = g_build_filename (repo->worktree, path, NULL);
+
+    file_exists = g_file_test (fullpath, G_FILE_TEST_EXISTS);
+
+    if (file_exists && seaf_stat (fullpath, &st) < 0) {
+        seaf_warning ("Failed to stat %s: %s.\n", fullpath, strerror(errno));
+        goto out;
+    }
+
+    if (file_exists && st.st_mtime == locked->old_mtime)
+        g_unlink (fullpath);
+
+out:
+    /* Remove the locked file record from db. */
+    locked_file_set_remove (fset, path, TURE);
+
+    g_free (fullpath);
+    return ret;
+}
+
+static void *
+check_locked_files (void *vdata)
+{
+    SeafRepo *repo = vdata;
+    LockedFileSet *fset;
+    GHashTableIter iter;
+    gpointer key, value;
+    char *path;
+    LockedFile *locked;
+    char index_path[SEAF_PATH_MAX];
+    struct index_state istate;
+
+    fset = seaf_repo_manager_get_locked_file_set (seaf->repo_mgr, repo->id);
+
+    if (g_hash_table_size (fset->locked_files) == 0) {
+        locked_file_set_free (fset);
+        return vdata;
+    }
+
+    memset (&istate, 0, sizeof(istate));
+    snprintf (index_path, SEAF_PATH_MAX, "%s/%s", repo->manager->index_dir, repo->id);
+    if (read_index_from (&istate, index_path, repo->version) < 0) {
+        seaf_warning ("Failed to load index.\n");
+        return vdata;
+    }
+
+    gboolean success;
+    g_hash_table_iter_init (&iter, fset->locked_files);
+    while (g_hash_table_iter_next (&iter, &key, &value)) {
+        path = key;
+        locked = value;
+
+        success = FALSE;
+        if (strcmp (file->operation, LOCKED_OP_UPDATE) == 0)
+            success = handle_locked_file_update (repo, &istate, fset, path, locked);
+        else if (strcmp (file->operation, LOCKED_OP_DELETE) == 0)
+            success = handle_locked_file_delete (repo, &istate, fset, path, locked);
+
+        if (success)
+            g_hash_table_iter_remove (&iter);
+    }
+
+    discard_index (&istate);
+    locked_file_set_free (fset);
+
+    return vdata
+}
+
+static void
+check_locked_files_done (void *vdata)
+{
+    SeafRepo *repo = vdata;
+    repo->checking_locked_files = FALSE;
+}
+
+#endif
+
 static int
 auto_sync_pulse (void *vmanager)
 {
@@ -2047,6 +2238,26 @@ auto_sync_pulse (void *vmanager)
 
         if (!manager->priv->auto_sync_enabled || !repo->auto_sync)
             continue;
+
+#ifdef WIN32
+        if (repo->version > 0) {
+            if (repo->checking_locked_files)
+                continue;
+
+            int now = (int)time(NULL);
+            if (repo->last_check_locked_time == 0 ||
+                now - repo->last_check_locked_time >= CHECK_LOCKED_FILES_INTERVAL)
+            {
+                repo->checking_locked_files = TRUE;
+                ccnet_job_manager_schedule_job (seaf->job_mgr,
+                                                check_locked_files,
+                                                check_locked_files_done,
+                                                repo);
+                repo->last_check_locked_time = now;
+
+            }
+        }
+#endif
 
         SyncInfo *info = get_sync_info (manager, repo->id);
 
