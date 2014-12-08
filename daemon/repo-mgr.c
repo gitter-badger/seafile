@@ -154,7 +154,7 @@ locked_file_set_add_update (LockedFileSet *fset,
     LockedFile *file;
     gboolean exists;
 
-    exists = g_hash_table_contains (fset->locked_files, path);
+    exists = (g_hash_table_lookup (fset->locked_files, path) != NULL);
 
     /* If a UPDATE record exists, don't update the old_mtime.
      * We need to keep the old mtime when the locked file was first detected.
@@ -169,7 +169,11 @@ locked_file_set_add_update (LockedFileSet *fset,
     pthread_mutex_lock (&mgr->priv->db_lock);
 
     if (!exists) {
-        sql = "INSERT INTO LockedFiles VALUSE (?, ?, ?, ?, NULL)";
+        seaf_debug ("New locked file record %.8s, %s, %s, %"
+                    G_GINT64_FORMAT".\n",
+                    fset->repo_id, path, operation, old_mtime);
+
+        sql = "INSERT INTO LockedFiles VALUES (?, ?, ?, ?, NULL)";
         stmt = sqlite_query_prepare (mgr->priv->db, sql);
         sqlite3_bind_text (stmt, 1, fset->repo_id, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text (stmt, 2, path, -1, SQLITE_TRANSIENT);
@@ -190,6 +194,9 @@ locked_file_set_add_update (LockedFileSet *fset,
 
         g_hash_table_insert (fset->locked_files, g_strdup(path), file);
     } else {
+        seaf_debug ("Update locked file record %.8s, %s, %s.\n",
+                    fset->repo_id, path, operation);
+
         sql = "UPDATE LockedFiles SET operation = ? WHERE repo_id = ? AND path = ?";
         stmt = sqlite_query_prepare (mgr->priv->db, sql);
         sqlite3_bind_text (stmt, 1, operation, -1, SQLITE_TRANSIENT);
@@ -221,8 +228,11 @@ locked_file_set_remove (LockedFileSet *fset, const char *path, gboolean db_only)
     char *sql;
     sqlite3_stmt *stmt;
 
-    if (!g_hash_table_contains (fset->locked_files, path))
+    if (g_hash_table_lookup (fset->locked_files, path) == NULL)
         return 0;
+
+    seaf_debug ("Remove locked file record %.8s, %s.\n",
+                fset->repo_id, path);
 
     pthread_mutex_lock (&mgr->priv->db_lock);
 
@@ -2401,10 +2411,10 @@ delete_worktree_dir_recursive_win32 (const char *worktree,
         wcscat (sub_path_w, fdata.cFileName);
 
         if (fdata.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            delete_worktree_dir_recursive_win32 (sub_path_w);
+            delete_worktree_dir_recursive_win32 (worktree, sub_path_w, locked_files);
         } else {
             if (!DeleteFileW (sub_path_w)) {
-                errro = GetLastError();
+                error = GetLastError();
 
                 sub_path = g_utf16_to_utf8 (sub_path_w, -1,
                                             NULL, NULL, NULL);

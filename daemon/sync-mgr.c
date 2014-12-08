@@ -2024,6 +2024,9 @@ handle_locked_file_update (SeafRepo *repo, struct index_state *istate,
     if (do_check_file_locked (path, repo->worktree))
         return FALSE;
 
+    seaf_debug ("Update previously locked file %s in repo %.8s.\n",
+                path, repo->id);
+
     /* If the file was locked on the last checkout, the worktree file was not
      * updated, but the index has been updated. So the ce in the index should
      * contain the information for the file to be updated.
@@ -2080,7 +2083,7 @@ out:
 
 remove_from_db:
     /* Remove the locked file record from db. */
-    locked_file_set_remove (fset, path, TURE);
+    locked_file_set_remove (fset, path, TRUE);
 
     g_free (fullpath);
     g_free (crypt);
@@ -2101,6 +2104,9 @@ handle_locked_file_delete (SeafRepo *repo, struct index_state *istate,
     if (do_check_file_locked (path, repo->worktree))
         return FALSE;
 
+    seaf_debug ("Delete previously locked file %s in repo %.8s.\n",
+                path, repo->id);
+
     fullpath = g_build_filename (repo->worktree, path, NULL);
 
     file_exists = g_file_test (fullpath, G_FILE_TEST_EXISTS);
@@ -2115,7 +2121,7 @@ handle_locked_file_delete (SeafRepo *repo, struct index_state *istate,
 
 out:
     /* Remove the locked file record from db. */
-    locked_file_set_remove (fset, path, TURE);
+    locked_file_set_remove (fset, path, TRUE);
 
     g_free (fullpath);
     return ret;
@@ -2154,9 +2160,9 @@ check_locked_files (void *vdata)
         locked = value;
 
         success = FALSE;
-        if (strcmp (file->operation, LOCKED_OP_UPDATE) == 0)
+        if (strcmp (locked->operation, LOCKED_OP_UPDATE) == 0)
             success = handle_locked_file_update (repo, &istate, fset, path, locked);
-        else if (strcmp (file->operation, LOCKED_OP_DELETE) == 0)
+        else if (strcmp (locked->operation, LOCKED_OP_DELETE) == 0)
             success = handle_locked_file_delete (repo, &istate, fset, path, locked);
 
         if (success)
@@ -2166,7 +2172,7 @@ check_locked_files (void *vdata)
     discard_index (&istate);
     locked_file_set_free (fset);
 
-    return vdata
+    return vdata;
 }
 
 static void
