@@ -88,16 +88,19 @@ load_locked_file (sqlite3_stmt *stmt, void *data)
 {
     GHashTable *ret = data;
     LockedFile *file;
-    const char *path, *operation;
+    const char *path, *operation, *file_id;
     gint64 old_mtime;
 
-    path = sqlite3_column_text (stmt, 0);
-    operation = sqlite3_column_text (stmt, 1);
+    path = (const char *)sqlite3_column_text (stmt, 0);
+    operation = (const char *)sqlite3_column_text (stmt, 1);
     old_mtime = sqlite3_column_int64 (stmt, 2);
+    file_id = (const char *)sqlite3_column_text (stmt, 3);
 
     file = g_new0 (LockedFile, 1);
     file->operation = g_strdup(operation);
     file->old_mtime = old_mtime;
+    if (file_id)
+        memcpy (file->file_id, file_id, 40);
 
     g_hash_table_insert (ret, g_strdup(path), file);
 
@@ -113,7 +116,7 @@ seaf_repo_manager_get_locked_file_set (SeafRepoManager *mgr, const char *repo_id
     char sql[256];
 
     sqlite3_snprintf (sizeof(sql), sql,
-                      "SELECT path, operation, old_mtime FROM LockedFiles "
+                      "SELECT path, operation, old_mtime, file_id FROM LockedFiles "
                       "WHERE repo_id = '%q'",
                       repo_id);
 
@@ -146,7 +149,8 @@ int
 locked_file_set_add_update (LockedFileSet *fset,
                             const char *path,
                             const char *operation,
-                            gint64 old_mtime)
+                            gint64 old_mtime,
+                            const char *file_id)
 {
     SeafRepoManager *mgr = fset->mgr;
     char *sql;
@@ -156,16 +160,6 @@ locked_file_set_add_update (LockedFileSet *fset,
 
     exists = (g_hash_table_lookup (fset->locked_files, path) != NULL);
 
-    /* If a UPDATE record exists, don't update the old_mtime.
-     * We need to keep the old mtime when the locked file was first detected.
-     */
-    if (exists) {
-        file = g_hash_table_lookup (fset->locked_files, path);
-        /* Nothing to update. */
-        if (strcmp(file->operation, operation) == 0)
-            return 0;
-    }
-
     pthread_mutex_lock (&mgr->priv->db_lock);
 
     if (!exists) {
@@ -173,12 +167,13 @@ locked_file_set_add_update (LockedFileSet *fset,
                     G_GINT64_FORMAT".\n",
                     fset->repo_id, path, operation, old_mtime);
 
-        sql = "INSERT INTO LockedFiles VALUES (?, ?, ?, ?, NULL)";
+        sql = "INSERT INTO LockedFiles VALUES (?, ?, ?, ?, ?, NULL)";
         stmt = sqlite_query_prepare (mgr->priv->db, sql);
         sqlite3_bind_text (stmt, 1, fset->repo_id, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text (stmt, 2, path, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text (stmt, 3, operation, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64 (stmt, 4, old_mtime);
+        sqlite3_bind_text (stmt, 5, file_id, -1, SQLITE_TRANSIENT);
         if (sqlite3_step (stmt) != SQLITE_DONE) {
             seaf_warning ("Failed to insert locked file %s to db: %s.\n",
                           path, sqlite3_errmsg (mgr->priv->db));
@@ -191,17 +186,25 @@ locked_file_set_add_update (LockedFileSet *fset,
         file = g_new0 (LockedFile, 1);
         file->operation = g_strdup(operation);
         file->old_mtime = old_mtime;
+        if (file_id)
+            memcpy (file->file_id, file_id, 40);
 
         g_hash_table_insert (fset->locked_files, g_strdup(path), file);
     } else {
         seaf_debug ("Update locked file record %.8s, %s, %s.\n",
                     fset->repo_id, path, operation);
 
-        sql = "UPDATE LockedFiles SET operation = ? WHERE repo_id = ? AND path = ?";
+        /* If a UPDATE record exists, don't update the old_mtime.
+         * We need to keep the old mtime when the locked file was first detected.
+         */
+
+        sql = "UPDATE LockedFiles SET operation = ?, file_id = ? "
+            "WHERE repo_id = ? AND path = ?";
         stmt = sqlite_query_prepare (mgr->priv->db, sql);
         sqlite3_bind_text (stmt, 1, operation, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text (stmt, 2, fset->repo_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_text (stmt, 3, path, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt, 2, file_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt, 3, fset->repo_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt, 4, path, -1, SQLITE_TRANSIENT);
         if (sqlite3_step (stmt) != SQLITE_DONE) {
             seaf_warning ("Failed to update locked file %s to db: %s.\n",
                           path, sqlite3_errmsg (mgr->priv->db));
@@ -214,6 +217,8 @@ locked_file_set_add_update (LockedFileSet *fset,
         file = g_hash_table_lookup (fset->locked_files, path);
         g_free (file->operation);
         file->operation = g_strdup(operation);
+        if (file_id)
+            memcpy (file->file_id, file_id, 40);
     }
 
     pthread_mutex_unlock (&mgr->priv->db_lock);
@@ -2707,7 +2712,7 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
                 delete_path (worktree, de->name, de->mode, ce->ce_mtime.sec);
             } else {
                 locked_file_set_add_update (fset, de->name, LOCKED_OP_DELETE,
-                                            ce->ce_mtime.sec);
+                                            ce->ce_mtime.sec, NULL);
             }
 #else
             delete_path (worktree, de->name, de->mode, ce->ce_mtime.sec);
@@ -2736,7 +2741,7 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
                     continue;
 
                 locked_file_set_add_update (fset, locked_file, LOCKED_OP_DELETE,
-                                            ce->ce_mtime.sec);
+                                            ce->ce_mtime.sec, NULL);
             }
 
             string_list_free (locked_files);
@@ -2789,13 +2794,6 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
                 add_ce = TRUE;
             }
 
-            /* If a file was locked on the last checkout, its blocks are still
-             * kept. So before downloading a new version, remove the old version.
-             */
-            if (!add_ce) {
-                cleanup_file_blocks (repo_id, repo_version, file_id);
-            }
-
 #ifdef WIN32
             is_locked = do_check_file_locked (de->name, worktree);
 #endif
@@ -2838,7 +2836,7 @@ seaf_repo_fetch_and_checkout (TransferTask *task,
             } else {
 #ifdef WIN32
                 locked_file_set_add_update (fset, de->name, LOCKED_OP_UPDATE,
-                                            ce->ce_mtime.sec);
+                                            ce->ce_mtime.sec, file_id);
 #endif
             }
 
@@ -3798,7 +3796,8 @@ open_db (SeafRepoManager *manager, const char *seaf_dir)
 
 #ifdef WIN32
     sql = "CREATE TABLE IF NOT EXISTS LockedFiles (repo_id TEXT, path TEXT, "
-        "operation TEXT, old_mtime INTEGER, new_path TEXT, PRIMARY KEY (repo_id, path));";
+        "operation TEXT, old_mtime INTEGER, new_path TEXT, file_id TEXT, "
+        "PRIMARY KEY (repo_id, path));";
     sqlite_query_exec (db, sql);
 #endif
 

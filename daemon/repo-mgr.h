@@ -435,6 +435,7 @@ seaf_repo_manager_is_ignored_hidden_file (const char *filename);
 typedef struct _LockedFile {
     char *operation;
     gint64 old_mtime;
+    char file_id[41];
 } LockedFile;
 
 typedef struct _LockedFileSet {
@@ -453,7 +454,8 @@ int
 locked_file_set_add_update (LockedFileSet *fset,
                             const char *path,
                             const char *operation,
-                            gint64 old_mtime);
+                            gint64 old_mtime,
+                            const char *file_id);
 
 int
 locked_file_set_remove (LockedFileSet *fset, const char *path, gboolean db_only);

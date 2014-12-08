@@ -1081,12 +1081,90 @@ repo_block_store_exists (SeafRepo *repo)
     return ret;
 }
 
+#ifdef WIN32
+
+static GHashTable *
+load_locked_files_blocks (const char *repo_id)
+{
+    LockedFileSet *fset;
+    GHashTable *block_id_hash;
+    GHashTableIter iter;
+    gpointer key, value;
+    LockedFile *locked;
+    Seafile *file;
+    int i;
+    char *blk_id;
+
+    fset = seaf_repo_manager_get_locked_file_set (seaf->repo_mgr, repo_id);
+
+    block_id_hash = g_hash_table_new_full (g_str_hash, g_str_equal, g_free, NULL);
+
+    g_hash_table_iter_init (&iter, fset->locked_files);
+    while (g_hash_table_iter_next (&iter, &key, &value)) {
+        locked = value;
+
+        if (strcmp (locked->operation, LOCKED_OP_UPDATE) == 0) {
+            file = seaf_fs_manager_get_seafile (seaf->fs_mgr,
+                                                fset->repo_id, 1,
+                                                locked->file_id);
+            if (!file)
+                continue;
+
+            for (i = 0; i < file->n_blocks; ++i) {
+                blk_id = g_strdup (file->blk_sha1s[i]);
+                g_hash_table_replace (block_id_hash, blk_id, blk_id);
+            }
+
+            seafile_unref (file);
+        }
+    }
+
+    locked_file_set_free (fset);
+
+    return block_id_hash;
+}
+
+static gboolean
+remove_block_cb (const char *store_id,
+                 int version,
+                 const char *block_id,
+                 void *user_data)
+{
+    GHashTable *block_hash = user_data;
+
+    if (!g_hash_table_lookup (block_hash, block_id))
+        seaf_block_manager_remove_block (seaf->block_mgr, store_id, version, block_id);
+
+    return TRUE;
+}
+
+#endif
+
 static void *
 remove_repo_blocks (void *vtask)
 {
     SyncTask *task = vtask;
 
+#ifndef WIN32
     seaf_block_manager_remove_store (seaf->block_mgr, task->repo->id);
+#else
+    GHashTable *block_hash;
+
+    block_hash = load_locked_files_blocks (task->repo->id);
+    if (g_hash_table_size (block_hash) == 0) {
+        g_hash_table_destroy (block_hash);
+        seaf_block_manager_remove_store (seaf->block_mgr, task->repo->id);
+        return vtask;
+    }
+
+    seaf_block_manager_foreach_block (seaf->block_mgr,
+                                      task->repo->id,
+                                      task->repo->version,
+                                      remove_block_cb,
+                                      block_hash);
+
+    g_hash_table_destroy (block_hash);
+#endif
 
     return vtask;
 }
@@ -1178,8 +1256,8 @@ update_sync_status (SyncTask *task)
              * blocks are not useful any more.
              */
             if (repo_block_store_exists (repo)) {
-                seaf_message ("Removing blocks for repo %s(%.8s).\n",
-                              repo->name, repo->id);
+                /* seaf_message ("Removing blocks for repo %s(%.8s).\n", */
+                /*               repo->name, repo->id); */
                 ccnet_job_manager_schedule_job (seaf->job_mgr,
                                                 remove_repo_blocks,
                                                 remove_blocks_done,
